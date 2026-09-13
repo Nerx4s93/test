@@ -20,18 +20,20 @@ AES-256-CBC утилита, совместимая с C++ DecryptAES256 (CryptoA
   # Работа с файлами:
   #   --in  — откуда читать (файл),
   #   --out — куда писать (файл).
-  #   При записи в файл по умолчанию пишется бинарь,
-  #   при выводе в stdout — hex.
-  python aes_tool.py encrypt --key <hex> --iv <hex> --in plain.txt  --out ct.bin
-  python aes_tool.py decrypt --key <hex> --iv <hex> --in ct.bin     --out plain.txt
+  #   Формат вывода управляется флагом --format {auto,hex,raw}.
+  #     encrypt, auto: файл -> raw, stdout -> hex
+  #     decrypt, auto: всегда raw (как есть), hex-фолбэк для stdout
+  python aes_tool.py encrypt --key <hex> --iv <hex> --in plain.txt --out ct.bin
+  python aes_tool.py decrypt --key <hex> --iv <hex> --in ct.bin    --out plain.txt
 
   # Явно задать формат вывода:
-  python aes_tool.py encrypt --key <hex> --iv <hex> --in plain.txt --out ct.hex --hex-output
-  python aes_tool.py encrypt --key <hex> --iv <hex> --text "Hi" --raw-output | xxd
+  python aes_tool.py encrypt --key <hex> --iv <hex> --in plain.txt --out ct.hex --format hex
+  python aes_tool.py decrypt --key <hex> --iv <hex> --in ct.bin  --format hex
+  python aes_tool.py encrypt --key <hex> --iv <hex> --text "Hi" --format raw | xxd
 
   # Пайпы: stdin -> stdout
   cat plain.txt | python aes_tool.py encrypt --key <hex> --iv <hex> > ct.hex
-  cat ct.bin    | python aes_tool.py decrypt --key <hex> --iv <hex> --raw-output
+  cat ct.bin    | python aes_tool.py decrypt --key <hex> --iv <hex> --format raw
 """
 
 import argparse
@@ -94,10 +96,8 @@ def read_input_bytes(args) -> bytes:
     if args.text is not None:
         return args.text.encode("utf-8")
     if args.infile is not None:
-        # Если файл есть — читаем его как бинарь (универсально: и текст, и бинарь)
         with open(args.infile, "rb") as f:
             return f.read()
-    # stdin
     if sys.stdin.isatty():
         sys.exit("[-] Укажите --text, --in или передайте данные через stdin")
     return sys.stdin.buffer.read()
@@ -112,11 +112,8 @@ def read_ciphertext_bytes(args) -> bytes:
             sys.exit("[-] --hex: некорректная hex-строка")
     if args.infile is not None:
         # Файл может быть как бинарным шифротекстом, так и текстовым hex-файлом.
-        # Пробуем прочитать как бинарь; если содержимое похоже на hex-текст — декодируем.
         with open(args.infile, "rb") as f:
             raw = f.read()
-        # эвристика: если длина чётная и все байты — hex-символы (и есть \n/пробелы),
-        # трактуем как hex-текст.
         stripped = raw.strip()
         if stripped and all(c in b"0123456789abcdefABCDEF \r\n\t" for c in stripped):
             try:
@@ -153,6 +150,38 @@ def write_output(data: bytes, args, as_hex: bool):
             print(data.hex())
 
 
+def resolve_format(args, command: str) -> str:
+    """
+    Определяет фактический формат вывода: 'hex' или 'raw'.
+
+    Приоритет:
+      1) явные устаревшие флаги --raw-output / --hex-output (для совместимости),
+      2) --format {auto,hex,raw},
+      3) значение 'auto' по умолчанию, зависящее от команды и наличия --out.
+    """
+    # 1) старые флаги
+    if getattr(args, "raw_output", False) and getattr(args, "hex_output", False):
+        sys.exit("[-] Нельзя одновременно указывать --raw-output и --hex-output")
+    if getattr(args, "raw_output", False):
+        return "raw"
+    if getattr(args, "hex_output", False):
+        return "hex"
+
+    # 2) --format
+    fmt = getattr(args, "format", "auto")
+    if fmt in ("hex", "raw"):
+        return fmt
+
+    # 3) auto
+    if command == "encrypt":
+        # файл -> raw, stdout -> hex
+        return "raw" if args.outfile else "hex"
+    if command == "decrypt":
+        # по умолчанию пишем как есть
+        return "raw"
+    return "raw"
+
+
 def cmd_genkey(_args):
     key = generate_key_hex()
     iv = generate_iv_hex()
@@ -165,18 +194,8 @@ def cmd_encrypt(args):
     iv = parse_hex(args.iv, BLOCK_SIZE, "iv")
     plaintext = read_input_bytes(args)
     ct = encrypt(plaintext, key, iv)
-
-    # Выбор формата вывода:
-    #   1) Явный --raw-output   -> бинарь
-    #   2) Явный --hex-output   -> hex
-    #   3) Иначе: файл -> бинарь, stdout -> hex
-    if args.raw_output:
-        as_hex = False
-    elif args.hex_output:
-        as_hex = True
-    else:
-        as_hex = args.outfile is None
-    write_output(ct, args, as_hex=as_hex)
+    fmt = resolve_format(args, "encrypt")
+    write_output(ct, args, as_hex=(fmt == "hex"))
 
 
 def cmd_decrypt(args):
@@ -184,10 +203,23 @@ def cmd_decrypt(args):
     iv = parse_hex(args.iv, BLOCK_SIZE, "iv")
     ct = read_ciphertext_bytes(args)
     pt = decrypt(ct, key, iv)
+    fmt = resolve_format(args, "decrypt")
+    write_output(pt, args, as_hex=(fmt == "hex"))
 
-    # Для расшифровки по умолчанию пишем "как есть" (текст/бинарь),
-    # --hex-output заставляет вывести hex.
-    write_output(pt, args, as_hex=args.hex_output)
+
+def add_format_args(sp):
+    """Общие флаги формата вывода для encrypt/decrypt."""
+    sp.add_argument(
+        "--format",
+        choices=("auto", "hex", "raw"),
+        default="auto",
+        help="формат вывода: auto (по умолчанию), hex или raw (бинарь)",
+    )
+    # Устаревшие алиасы — сохранены для обратной совместимости.
+    sp.add_argument("--raw-output", action="store_true",
+                    help="алиас --format raw")
+    sp.add_argument("--hex-output", action="store_true",
+                    help="алиас --format hex")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -208,11 +240,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--in", dest="infile",
                     help="файл с открытым текстом (бинарный/текстовый)")
     sp.add_argument("--out", dest="outfile",
-                    help="файл для шифротекста (по умолчанию — бинарь)")
-    sp.add_argument("--raw-output", action="store_true",
-                    help="вывести шифротекст в бинаре (в т.ч. в stdout)")
-    sp.add_argument("--hex-output", action="store_true",
-                    help="вывести шифротекст в hex (в т.ч. в файл)")
+                    help="файл для шифротекста")
+    add_format_args(sp)
     sp.set_defaults(func=cmd_encrypt)
 
     # decrypt
@@ -224,8 +253,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="файл с шифротекстом (бинарь или hex-текст)")
     sp.add_argument("--out", dest="outfile",
                     help="файл для открытого текста")
-    sp.add_argument("--hex-output", action="store_true",
-                    help="вывести результат как hex (по умолчанию — как есть)")
+    add_format_args(sp)
     sp.set_defaults(func=cmd_decrypt)
 
     return p
