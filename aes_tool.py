@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""
+AES-256-CBC утилита, совместимая с C++ DecryptAES256 (CryptoAPI).
+
+Формат входных/выходных данных:
+  - key : hex-строка, 64 символа (32 байта)
+  - iv  : hex-строка, 32 символа (16 байт)
+  - data: hex-строка (по умолчанию) или --raw для чтения из файла / stdin
+
+Использование:
+  # Сгенерировать ключ и IV
+  python aes_tool.py genkey
+
+  # Зашифровать строку (текст -> hex-шифротекст)
+  python aes_tool.py encrypt --key <hex> --iv <hex> --text "Hello"
+
+  # Расшифровать hex-шифротекст
+  python aes_tool.py decrypt --key <hex> --iv <hex> --hex <hex_ct>
+
+  # Работа с файлами
+  python aes_tool.py encrypt --key <hex> --iv <hex> --in plain.txt --out ct.bin
+  python aes_tool.py decrypt --key <hex> --iv <hex> --in ct.bin --out plain.txt
+"""
+
+import argparse
+import secrets
+import sys
+
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+
+BLOCK_SIZE = 16
+KEY_SIZE = 32  # AES-256
+
+
+# ---------- Валидация ----------
+
+def parse_hex(value: str, expected_bytes: int, name: str) -> bytes:
+    """Преобразует hex-строку в байты с проверкой длины."""
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError:
+        sys.exit(f"[-] {name}: не является корректной hex-строкой")
+    if len(raw) != expected_bytes:
+        sys.exit(f"[-] {name}: ожидалось {expected_bytes} байт "
+                 f"({expected_bytes*2} hex-символов), получено {len(raw)}")
+    return raw
+
+
+# ---------- Крипто-операции ----------
+
+def encrypt(plaintext: bytes, key: bytes, iv: bytes) -> bytes:
+    """AES-256-CBC с PKCS#7-паддингом (как CryptEncrypt в CryptoAPI)."""
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    return cipher.encrypt(pad(plaintext, BLOCK_SIZE))
+
+
+def decrypt(ciphertext: bytes, key: bytes, iv: bytes) -> bytes:
+    """AES-256-CBC со снятием PKCS#7-паддинга (как CryptDecrypt(..., TRUE, ...))."""
+    if len(ciphertext) == 0 or len(ciphertext) % BLOCK_SIZE != 0:
+        sys.exit(f"[-] Шифротекст должен быть кратен {BLOCK_SIZE} байтам "
+                 f"(получено {len(ciphertext)})")
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    try:
+        return unpad(cipher.decrypt(ciphertext), BLOCK_SIZE)
+    except ValueError:
+        sys.exit("[-] Ошибка снятия паддинга: неверный ключ, IV или повреждённые данные")
+
+
+def generate_key_hex() -> str:
+    return secrets.token_hex(KEY_SIZE)
+
+
+def generate_iv_hex() -> str:
+    return secrets.token_hex(BLOCK_SIZE)
+
+
+# ---------- CLI ----------
+
+def read_input_bytes(args) -> bytes:
+    """Возвращает входные данные в виде байт (для шифрования)."""
+    if args.text is not None:
+        return args.text.encode("utf-8")
+    if args.infile is not None:
+        with open(args.infile, "rb") as f:
+            return f.read()
+    # stdin
+    if sys.stdin.isatty():
+        sys.exit("[-] Укажите --text, --in или передайте данные через stdin")
+    return sys.stdin.buffer.read()
+
+
+def read_ciphertext_bytes(args) -> bytes:
+    """Возвращает шифротекст в виде байт (для расшифровки)."""
+    if args.hex is not None:
+        try:
+            return bytes.fromhex(args.hex)
+        except ValueError:
+            sys.exit("[-] --hex: некорректная hex-строка")
+    if args.infile is not None:
+        with open(args.infile, "rb") as f:
+            return f.read()
+    if sys.stdin.isatty():
+        sys.exit("[-] Укажите --hex, --in или передайте данные через stdin")
+    return sys.stdin.buffer.read()
+
+
+def write_output(data: bytes, args, as_hex: bool):
+    """Пишет результат в файл или stdout (hex или raw)."""
+    if args.outfile:
+        if as_hex:
+            with open(args.outfile, "w", encoding="ascii") as f:
+                f.write(data.hex())
+        else:
+            with open(args.outfile, "wb") as f:
+                f.write(data)
+    else:
+        if as_hex:
+            print(data.hex())
+        else:
+            try:
+                sys.stdout.write(data.decode("utf-8"))
+                if not data.endswith(b"\n"):
+                    sys.stdout.write("\n")
+            except UnicodeDecodeError:
+                # не текст — выведем hex
+                print(data.hex())
+
+
+def cmd_genkey(_args):
+    key = generate_key_hex()
+    iv = generate_iv_hex()
+    print(f"KEY = {key}")
+    print(f"IV  = {iv}")
+
+
+def cmd_encrypt(args):
+    key = parse_hex(args.key, KEY_SIZE, "key")
+    iv = parse_hex(args.iv, BLOCK_SIZE, "iv")
+    plaintext = read_input_bytes(args)
+    ct = encrypt(plaintext, key, iv)
+    # По умолчанию шифротекст выводим в hex — удобно копировать в C++.
+    write_output(ct, args, as_hex=not args.raw_output)
+
+
+def cmd_decrypt(args):
+    key = parse_hex(args.key, KEY_SIZE, "key")
+    iv = parse_hex(args.iv, BLOCK_SIZE, "iv")
+    ct = read_ciphertext_bytes(args)
+    pt = decrypt(ct, key, iv)
+    write_output(pt, args, as_hex=args.hex_output)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="AES-256-CBC шифрование/расшифровка (совместимо с CryptoAPI)"
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # genkey
+    sp = sub.add_parser("genkey", help="сгенерировать ключ и IV")
+    sp.set_defaults(func=cmd_genkey)
+
+    # encrypt
+    sp = sub.add_parser("encrypt", help="зашифровать данные")
+    sp.add_argument("--key", required=True, help="ключ, 64 hex-символа")
+    sp.add_argument("--iv", required=True, help="IV, 32 hex-символа")
+    sp.add_argument("--text", help="открытый текст (строка)")
+    sp.add_argument("--in", dest="infile", help="файл с открытым текстом")
+    sp.add_argument("--out", dest="outfile", help="файл для шифротекста")
+    sp.add_argument("--raw-output", action="store_true",
+                    help="вывести шифротекст в бинаре (по умолчанию hex)")
+    sp.set_defaults(func=cmd_encrypt)
+
+    # decrypt
+    sp = sub.add_parser("decrypt", help="расшифровать данные")
+    sp.add_argument("--key", required=True, help="ключ, 64 hex-символа")
+    sp.add_argument("--iv", required=True, help="IV, 32 hex-символа")
+    sp.add_argument("--hex", dest="hex", help="шифротекст как hex-строка")
+    sp.add_argument("--in", dest="infile", help="файл с шифротекстом")
+    sp.add_argument("--out", dest="outfile", help="файл для открытого текста")
+    sp.add_argument("--hex-output", action="store_true",
+                    help="вывести результат как hex (по умолчанию — как есть)")
+    sp.set_defaults(func=cmd_decrypt)
+
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
